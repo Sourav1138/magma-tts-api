@@ -8,11 +8,13 @@ import requests
 import urllib3
 import json
 import hashlib
+import shutil
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from datetime import datetime, timedelta
 import threading
+import tempfile
 
 # --- CONFIGURATION ---
 app = Flask(__name__)
@@ -36,27 +38,62 @@ AVAILABLE_VOICES = [
     {"id": "shimmer", "name": "Shimmer", "description": "Soft, calming voice"}
 ]
 
-# Temporary file storage
-TEMP_STORAGE = {}
-TEMP_CLEANUP_INTERVAL = 300  # 5 minutes
+# File storage setup
+TEMP_DIR = os.path.join(tempfile.gettempdir(), "magma_tts_files")
+os.makedirs(TEMP_DIR, exist_ok=True)
+logger.info(f"Using temp directory: {TEMP_DIR}")
+
+# Metadata storage
+FILE_METADATA = {}
+METADATA_FILE = os.path.join(TEMP_DIR, "metadata.json")
+
+def load_metadata():
+    """Load metadata from file"""
+    global FILE_METADATA
+    try:
+        if os.path.exists(METADATA_FILE):
+            with open(METADATA_FILE, 'r') as f:
+                FILE_METADATA = json.load(f)
+            logger.info(f"Loaded {len(FILE_METADATA)} file metadata entries")
+    except Exception as e:
+        logger.error(f"Failed to load metadata: {e}")
+        FILE_METADATA = {}
+
+def save_metadata():
+    """Save metadata to file"""
+    try:
+        with open(METADATA_FILE, 'w') as f:
+            json.dump(FILE_METADATA, f)
+    except Exception as e:
+        logger.error(f"Failed to save metadata: {e}")
 
 def cleanup_expired_files():
     """Remove expired temporary files"""
-    current_time = datetime.now()
-    expired_keys = []
+    current_time = datetime.now().timestamp()
+    expired_files = []
     
-    for key, data in TEMP_STORAGE.items():
-        if data['expires'] < current_time:
-            expired_keys.append(key)
+    for file_id, metadata in list(FILE_METADATA.items()):
+        if metadata['expires'] < current_time:
+            expired_files.append(file_id)
     
-    for key in expired_keys:
-        del TEMP_STORAGE[key]
-        logger.info(f"Cleaned up expired file: {key}")
+    for file_id in expired_files:
+        try:
+            file_path = os.path.join(TEMP_DIR, f"{file_id}.mp3")
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            del FILE_METADATA[file_id]
+            logger.info(f"Cleaned up expired file: {file_id}")
+        except Exception as e:
+            logger.error(f"Error cleaning up file {file_id}: {e}")
+    
+    if expired_files:
+        save_metadata()
     
     # Schedule next cleanup
-    threading.Timer(TEMP_CLEANUP_INTERVAL, cleanup_expired_files).start()
+    threading.Timer(300, cleanup_expired_files).start()
 
-# Start cleanup thread
+# Initialize
+load_metadata()
 cleanup_expired_files()
 
 # --- BACKEND LOGIC (Unchanged) ---
@@ -206,9 +243,11 @@ def api_root():
         "endpoints": {
             "voices": "/api/voices",
             "generate": "/api/generate (POST)",
-            "download": "/api/download/<file_id>"
+            "download": "/api/download/<file_id>",
+            "status": "/api/status/<file_id>"
         },
-        "status": "operational"
+        "status": "operational",
+        "temp_dir": TEMP_DIR
     })
 
 @app.route('/api/voices', methods=['GET'])
@@ -263,21 +302,34 @@ def generate_tts():
         
         # Generate unique file ID
         file_id = hashlib.md5(f"{text}{voice}{speed}{time.time()}".encode()).hexdigest()[:16]
+        file_path = os.path.join(TEMP_DIR, f"{file_id}.mp3")
         
-        # Store in temporary storage (valid for 1 hour)
-        TEMP_STORAGE[file_id] = {
-            'audio_data': audio_data,
+        # Save audio file
+        with open(file_path, 'wb') as f:
+            f.write(audio_data)
+        
+        # Store metadata
+        expires_at = time.time() + 3600  # 1 hour from now
+        FILE_METADATA[file_id] = {
             'filename': f"tts_{voice}_{int(time.time())}.mp3",
-            'created': datetime.now(),
-            'expires': datetime.now() + timedelta(hours=1),
+            'created': time.time(),
+            'expires': expires_at,
             'voice': voice,
             'speed': speed,
-            'text_length': len(text)
+            'text_length': len(text),
+            'file_path': file_path,
+            'size_bytes': len(audio_data)
         }
+        save_metadata()
         
-        # Generate download URL
-        base_url = request.host_url.rstrip('/')
-        download_url = f"{base_url}/api/download/{file_id}"
+        # Generate download URL - handle HTTPS correctly
+        if request.headers.get('X-Forwarded-Proto') == 'https':
+            scheme = 'https://'
+        else:
+            scheme = 'http://'
+        
+        host = request.host
+        download_url = f"{scheme}{host}/api/download/{file_id}"
         
         return jsonify({
             "error": False,
@@ -285,7 +337,7 @@ def generate_tts():
             "data": {
                 "file_id": file_id,
                 "download_url": download_url,
-                "expires_at": TEMP_STORAGE[file_id]['expires'].isoformat(),
+                "expires_at": datetime.fromtimestamp(expires_at).isoformat(),
                 "voice": voice,
                 "speed": speed,
                 "size_bytes": len(audio_data),
@@ -303,68 +355,122 @@ def generate_tts():
 @app.route('/api/download/<file_id>', methods=['GET'])
 def download_audio(file_id):
     """Download generated audio file"""
-    if file_id not in TEMP_STORAGE:
+    try:
+        if file_id not in FILE_METADATA:
+            return jsonify({
+                "error": True,
+                "message": "File not found"
+            }), 404
+        
+        metadata = FILE_METADATA[file_id]
+        file_path = metadata['file_path']
+        
+        # Check if expired
+        if time.time() > metadata['expires']:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                del FILE_METADATA[file_id]
+                save_metadata()
+            except:
+                pass
+            return jsonify({
+                "error": True,
+                "message": "File has expired"
+            }), 410  # Gone
+        
+        # Check if file exists
+        if not os.path.exists(file_path):
+            del FILE_METADATA[file_id]
+            save_metadata()
+            return jsonify({
+                "error": True,
+                "message": "File not found on disk"
+            }), 404
+        
+        # Read and return file
+        with open(file_path, 'rb') as f:
+            audio_data = f.read()
+        
+        response = Response(
+            audio_data,
+            mimetype="audio/mpeg",
+            headers={
+                "Content-Disposition": f"attachment; filename={metadata['filename']}",
+                "X-Expires-At": datetime.fromtimestamp(metadata['expires']).isoformat(),
+                "X-Voice": metadata['voice'],
+                "X-Speed": str(metadata['speed'])
+            }
+        )
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Download error for {file_id}: {e}")
         return jsonify({
             "error": True,
-            "message": "File not found or expired"
-        }), 404
-    
-    file_data = TEMP_STORAGE[file_id]
-    
-    # Check if expired
-    if datetime.now() > file_data['expires']:
-        del TEMP_STORAGE[file_id]
-        return jsonify({
-            "error": True,
-            "message": "File has expired"
-        }), 410  # Gone
-    
-    # Return audio file
-    response = Response(
-        file_data['audio_data'],
-        mimetype="audio/mpeg",
-        headers={
-            "Content-Disposition": f"attachment; filename={file_data['filename']}",
-            "X-Expires-At": file_data['expires'].isoformat(),
-            "X-Voice": file_data['voice'],
-            "X-Speed": str(file_data['speed'])
-        }
-    )
-    
-    return response
+            "message": f"Download failed: {str(e)}"
+        }), 500
 
 @app.route('/api/status/<file_id>', methods=['GET'])
 def check_status(file_id):
     """Check if a file exists and its expiration status"""
-    if file_id not in TEMP_STORAGE:
+    try:
+        if file_id not in FILE_METADATA:
+            return jsonify({
+                "exists": False,
+                "message": "File not found"
+            })
+        
+        metadata = FILE_METADATA[file_id]
+        current_time = time.time()
+        expires_at = metadata['expires']
+        
+        # Check if file actually exists on disk
+        file_exists = os.path.exists(metadata['file_path'])
+        
+        return jsonify({
+            "exists": file_exists,
+            "expired": current_time > expires_at,
+            "file_on_disk": file_exists,
+            "expires_at": datetime.fromtimestamp(expires_at).isoformat(),
+            "seconds_remaining": max(0, int(expires_at - current_time)),
+            "voice": metadata['voice'],
+            "speed": metadata['speed'],
+            "created": datetime.fromtimestamp(metadata['created']).isoformat(),
+            "size_bytes": metadata['size_bytes']
+        })
+    except Exception as e:
         return jsonify({
             "exists": False,
-            "message": "File not found"
+            "message": f"Error checking status: {str(e)}"
         })
-    
-    file_data = TEMP_STORAGE[file_id]
-    current_time = datetime.now()
-    expires_at = file_data['expires']
-    
-    return jsonify({
-        "exists": True,
-        "expired": current_time > expires_at,
-        "expires_at": expires_at.isoformat(),
-        "seconds_remaining": max(0, int((expires_at - current_time).total_seconds())),
-        "voice": file_data['voice'],
-        "speed": file_data['speed'],
-        "created": file_data['created'].isoformat(),
-        "size_bytes": len(file_data['audio_data'])
-    })
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
+    try:
+        return jsonify({
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "temp_files": len(FILE_METADATA),
+            "temp_dir": TEMP_DIR,
+            "disk_usage": f"{sum(os.path.getsize(f) for f in os.listdir(TEMP_DIR) if f.endswith('.mp3')) / (1024*1024):.2f} MB",
+            "service": "MagmaTTS API"
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e)
+        }), 500
+
+@app.route('/cleanup', methods=['POST'])
+def manual_cleanup():
+    """Manually trigger cleanup (admin only)"""
+    cleanup_expired_files()
     return jsonify({
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "temp_files": len(TEMP_STORAGE),
-        "service": "MagmaTTS API"
+        "message": "Cleanup triggered",
+        "remaining_files": len(FILE_METADATA)
     })
 
 if __name__ == '__main__':
@@ -373,5 +479,7 @@ if __name__ == '__main__':
     
     logger.info(f"Starting MagmaTTS API on {host}:{port}")
     logger.info(f"Available voices: {[v['id'] for v in AVAILABLE_VOICES]}")
+    logger.info(f"Temp directory: {TEMP_DIR}")
+    logger.info(f"Loaded {len(FILE_METADATA)} existing files")
     
     app.run(host=host, port=port, threaded=True)
